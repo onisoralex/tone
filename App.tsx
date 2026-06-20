@@ -13,11 +13,11 @@ import Purchases from "react-native-purchases";
 import * as SecureStore from "expo-secure-store";
 import { Colors } from "./constants/Colors";
 import { Layout } from "./constants/Layout";
-import { generateWhiteNoise, generatePinkNoise, generateBrownNoise } from "./utils/audioBuffers";
+import { generateNoise, BUFFER_DURATION } from "./utils/audioBuffers";
+import type { NoiseType } from "./utils/audioBuffers";
 import { AudioContext } from "react-native-audio-api";
 
 type WaveformType = "sine" | "square" | "sawtooth" | "triangle";
-type NoiseType = "white" | "pink" | "brown";
 type AudioMode = "waveform" | "noise";
 
 const BANNER_ID = __DEV__
@@ -41,6 +41,8 @@ export default function App() {
   const oscillatorRef = useRef<any>(null);
   const noiseSourceRef = useRef<any>(null);
   const gainRef = useRef<any>(null);
+  const noiseChainTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const noiseChainNoiseTypeRef = useRef<NoiseType>("white");
 
   // Check ads-removed status on mount, fast path from storage then background verify
   useEffect(() => {
@@ -84,6 +86,10 @@ export default function App() {
     const ctx = audioContextRef.current;
     if (!ctx) return;
 
+    if (noiseChainTimerRef.current !== null) {
+      clearTimeout(noiseChainTimerRef.current);
+      noiseChainTimerRef.current = null;
+    }
     if (oscillatorRef.current) {
       try {
         oscillatorRef.current.stop();
@@ -105,6 +111,35 @@ export default function App() {
     setIsPlaying(false);
   }, []);
 
+  const startNoiseChain = useCallback((ctx: AudioContext, gain: any, type: NoiseType) => {
+    noiseChainNoiseTypeRef.current = type;
+
+    const schedule = (startTime: number) => {
+      const buffer = generateNoise(ctx, noiseChainNoiseTypeRef.current);
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(gain);
+      source.start(startTime);
+      noiseSourceRef.current = source;
+
+      const nextStart = startTime + BUFFER_DURATION;
+
+      // 2ms gain dip at the buffer boundary — eliminates amplitude discontinuity click
+      const XFADE = 0.002;
+      gain.gain.setValueAtTime(1, nextStart - XFADE);
+      gain.gain.linearRampToValueAtTime(0, nextStart);
+      gain.gain.linearRampToValueAtTime(1, nextStart + XFADE);
+
+      // Fire 3s before the next buffer is needed — plenty of time to generate it
+      const msUntilGenerate = (nextStart - ctx.currentTime - 3) * 1000;
+      noiseChainTimerRef.current = setTimeout(() => {
+        schedule(nextStart);
+      }, Math.max(100, msUntilGenerate));
+    };
+
+    schedule(ctx.currentTime);
+  }, []);
+
   const startPlayback = useCallback(() => {
     const ctx = getOrCreateContext();
     const gain = ctx.createGain();
@@ -120,21 +155,11 @@ export default function App() {
       osc.start();
       oscillatorRef.current = osc;
     } else {
-      const bufferFn =
-        noiseType === "white" ? generateWhiteNoise
-        : noiseType === "pink" ? generatePinkNoise
-        : generateBrownNoise;
-      const buffer = bufferFn(ctx);
-      const source = ctx.createBufferSource();
-      source.buffer = buffer;
-      source.loop = true;
-      source.connect(gain);
-      source.start();
-      noiseSourceRef.current = source;
+      startNoiseChain(ctx, gain, noiseType);
     }
 
     setIsPlaying(true);
-  }, [mode, waveform, noiseType, frequency]);
+  }, [mode, waveform, noiseType, frequency, startNoiseChain]);
 
   const togglePlayback = useCallback(() => {
     if (isPlaying) {
@@ -199,10 +224,30 @@ export default function App() {
   }, [isPlaying, mode, frequency, stopPlayback]);
 
   const selectNoise = useCallback((n: NoiseType) => {
-    if (isPlaying) stopPlayback();
+    const wasPlaying = isPlaying;
+    const ctx = audioContextRef.current;
+
+    if (wasPlaying && mode === "noise" && ctx) {
+      // Cancel the pending chain timer and any scheduled gain events, then restart
+      if (noiseChainTimerRef.current !== null) {
+        clearTimeout(noiseChainTimerRef.current);
+        noiseChainTimerRef.current = null;
+      }
+      if (noiseSourceRef.current) {
+        try { noiseSourceRef.current.stop(); noiseSourceRef.current.disconnect(); } catch {}
+        noiseSourceRef.current = null;
+      }
+      const gain = gainRef.current!;
+      gain.gain.cancelScheduledValues(ctx.currentTime);
+      gain.gain.setValueAtTime(1, ctx.currentTime);
+      startNoiseChain(ctx, gain, n);
+    } else if (wasPlaying) {
+      stopPlayback();
+    }
+
     setNoiseType(n);
     setMode("noise");
-  }, [isPlaying, stopPlayback]);
+  }, [isPlaying, mode, stopPlayback, startNoiseChain]);
 
   const handlePurchase = useCallback(async () => {
     setPurchaseError(null);
